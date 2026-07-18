@@ -388,7 +388,8 @@ namespace BlendshapeAnalyzer.Editor
                     }
 
                     // Determine if the entire mesh is active/referenced/used
-                    bool isMeshUsed = smr.gameObject.activeSelf || 
+                    bool isMeshUsed = (smr.sharedMesh.blendShapeCount == 0) ||  // Keep meshes with no blendshapes
+                                      smr.gameObject.activeSelf || 
                                       meshData.usedBlendshapes.Count > 0 || 
                                       meshData.isReferencedByAnimation;
 
@@ -468,6 +469,15 @@ namespace BlendshapeAnalyzer.Editor
                         // Strip unused blendshapes from the mesh
                         if (targetSMR.sharedMesh != null && meshData.unusedBlendshapes.Count > 0)
                         {
+                            // Save original weights by name FIRST
+                            Dictionary<string, float> originalWeights = new Dictionary<string, float>();
+                            int oldBsCount = targetSMR.sharedMesh.blendShapeCount;
+                            for (int bsIdx = 0; bsIdx < oldBsCount; bsIdx++)
+                            {
+                                string bsName = targetSMR.sharedMesh.GetBlendShapeName(bsIdx);
+                                originalWeights[bsName] = targetSMR.GetBlendShapeWeight(bsIdx);
+                            }
+
                             // Build a safety set: used blendshapes PLUS any standard VRChat viseme
                             // names present on this mesh, so voice never breaks.
                             var keepSet = new HashSet<string>(meshData.usedBlendshapes);
@@ -480,16 +490,7 @@ namespace BlendshapeAnalyzer.Editor
                             }
 
                             string assetPath = $"{rootPath}/{targetSMR.sharedMesh.name}_optimized.asset";
-                            Mesh optimizedMesh = CreateOptimizedMesh(targetSMR.sharedMesh, keepSet, assetPath);
-
-                            // Save original weights by name
-                            Dictionary<string, float> originalWeights = new Dictionary<string, float>();
-                            int oldBsCount = targetSMR.sharedMesh.blendShapeCount;
-                            for (int bsIdx = 0; bsIdx < oldBsCount; bsIdx++)
-                            {
-                                string bsName = targetSMR.sharedMesh.GetBlendShapeName(bsIdx);
-                                originalWeights[bsName] = targetSMR.GetBlendShapeWeight(bsIdx);
-                            }
+                            Mesh optimizedMesh = CreateOptimizedMesh(targetSMR.sharedMesh, keepSet, assetPath, originalWeights);
 
                             // Assign optimized mesh
                             targetSMR.sharedMesh = optimizedMesh;
@@ -539,14 +540,53 @@ namespace BlendshapeAnalyzer.Editor
             }
         }
 
-        private static Mesh CreateOptimizedMesh(Mesh sourceMesh, HashSet<string> usedBlendshapes, string savePath)
+        private static Mesh CreateOptimizedMesh(Mesh sourceMesh, HashSet<string> usedBlendshapes, string savePath, Dictionary<string, float> originalWeights = null)
         {
             Mesh newMesh = new Mesh();
             newMesh.name = sourceMesh.name + "_Optimized";
 
-            newMesh.vertices = sourceMesh.vertices;
-            newMesh.normals = sourceMesh.normals;
-            newMesh.tangents = sourceMesh.tangents;
+            Vector3[] vertices = sourceMesh.vertices;
+            Vector3[] normals = sourceMesh.normals;
+            Vector4[] tangents = sourceMesh.tangents;
+
+            // Bake unused blendshapes with non-zero weights into the mesh basis
+            if (originalWeights != null)
+            {
+                int sourceBsCount = sourceMesh.blendShapeCount;
+                for (int i = 0; i < sourceBsCount; i++)
+                {
+                    string bsName = sourceMesh.GetBlendShapeName(i);
+                    
+                    // If this blendshape is unused but has a non-zero weight, bake it into the basis
+                    if (!usedBlendshapes.Contains(bsName) && originalWeights.TryGetValue(bsName, out float weight) && weight != 0f)
+                    {
+                        int frameCount = sourceMesh.GetBlendShapeFrameCount(i);
+                        if (frameCount > 0)
+                        {
+                            Vector3[] deltaVertices = new Vector3[sourceMesh.vertexCount];
+                            Vector3[] deltaNormals = new Vector3[sourceMesh.vertexCount];
+                            Vector3[] deltaTangents = new Vector3[sourceMesh.vertexCount];
+                            
+                            // Get the frame data (usually frame 0 for 100% weight)
+                            sourceMesh.GetBlendShapeFrameVertices(i, frameCount - 1, deltaVertices, deltaNormals, deltaTangents);
+                            
+                            // Apply the blendshape deformation proportional to its weight (normalized to 0-1)
+                            float normalizedWeight = weight / 100f;
+                            for (int v = 0; v < vertices.Length; v++)
+                            {
+                                vertices[v] += deltaVertices[v] * normalizedWeight;
+                                normals[v] += deltaNormals[v] * normalizedWeight;
+                                // Tangents are Vector4 where XYZ is tangent direction and W is binormal direction
+                                tangents[v] += new Vector4(deltaTangents[v].x, deltaTangents[v].y, deltaTangents[v].z, 0) * normalizedWeight;
+                            }
+                        }
+                    }
+                }
+            }
+
+            newMesh.vertices = vertices;
+            newMesh.normals = normals;
+            newMesh.tangents = tangents;
             newMesh.uv = sourceMesh.uv;
             newMesh.uv2 = sourceMesh.uv2;
             newMesh.uv3 = sourceMesh.uv3;
@@ -561,8 +601,8 @@ namespace BlendshapeAnalyzer.Editor
                 newMesh.SetIndices(sourceMesh.GetIndices(i), sourceMesh.GetTopology(i), i);
             }
 
-            int sourceBsCount = sourceMesh.blendShapeCount;
-            for (int i = 0; i < sourceBsCount; i++)
+            int usedBsCount = sourceMesh.blendShapeCount;
+            for (int i = 0; i < usedBsCount; i++)
             {
                 string bsName = sourceMesh.GetBlendShapeName(i);
                 if (usedBlendshapes.Contains(bsName))
